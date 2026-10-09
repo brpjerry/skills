@@ -4,3 +4,4 @@ This workspace is for sysadmin and system maintenance related work. The installe
 
 - Put generated files and other session output in `work/` (gitignored).
 - Put final reports into `reports/` (gitignored).
+- When a skill here starts subagents, pick their models from `subagents.md`.
