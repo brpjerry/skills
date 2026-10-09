@@ -1,0 +1,8 @@
+# Per-user agent settings
+**/.claude/settings.local.json
+CLAUDE.local.md
+
+# Session output inside workspaces
+work/
+
+__pycache__/
