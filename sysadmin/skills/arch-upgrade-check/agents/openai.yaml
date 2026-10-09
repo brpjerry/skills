@@ -1,0 +1,5 @@
+interface:
+  short_description: "Read-only Arch pre-upgrade report"
+
+policy:
+  allow_implicit_invocation: false
