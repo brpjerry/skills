@@ -2,7 +2,8 @@
 """Validate workspace layout and SKILL.md frontmatter for Claude Code and Codex.
 
 A workspace is the repo root or any top-level directory with a skills/ folder
-(or the .claude/.agents symlinks that point at one).
+(or the .claude/.agents symlinks that point at one). Skills in global/ are
+linked into the user-level skill folders and must be explicit-only.
 """
 import os
 import re
@@ -12,6 +13,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
+GLOBAL = ROOT / "global"
 LINKS = (".claude/skills", ".agents/skills")
 NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 FRONTMATTER_RE = re.compile(r"\A---\n(.*?)^---[ \t]*$", re.S | re.M)
@@ -42,7 +44,20 @@ def check_layout(ws):
         err(claude, "must import @AGENTS.md so Claude Code sees the same instructions as Codex")
 
 
-def check_skill(skill_dir):
+def check_explicit_only(skill_dir, fm):
+    """A global skill loads in every session, so it may only run when invoked by name."""
+    if fm.get("disable-model-invocation") is not True:
+        err(skill_dir / "SKILL.md", "global skills must set disable-model-invocation: true")
+    oa = skill_dir / "agents" / "openai.yaml"
+    try:
+        policy = (yaml.safe_load(oa.read_text()) or {}).get("policy") or {}
+    except (OSError, yaml.YAMLError):
+        policy = {}
+    if policy.get("allow_implicit_invocation") is not False:
+        err(oa, "global skills must set policy.allow_implicit_invocation: false")
+
+
+def check_skill(skill_dir, explicit_only=False):
     """Return the skill's name if its SKILL.md is valid, else None."""
     md = skill_dir / "SKILL.md"
     if not md.is_file():
@@ -78,6 +93,8 @@ def check_skill(skill_dir):
     elif desc.lstrip().startswith("TODO"):
         err(md, "description is still the scaffold placeholder")
         ok = False
+    if explicit_only:
+        check_explicit_only(skill_dir, fm)
     return name if ok else None
 
 
@@ -91,13 +108,20 @@ def skill_dirs(ws):
 def main():
     workspaces = [ROOT] + sorted(
         d for d in ROOT.iterdir()
-        if d.is_dir() and not d.is_symlink() and not d.name.startswith(".") and is_workspace(d)
+        if d.is_dir() and not d.is_symlink() and not d.name.startswith(".") and d != GLOBAL and is_workspace(d)
     )
     for ws in workspaces:
         check_layout(ws)
 
-    shared = {name for d in skill_dirs(ROOT) if (name := check_skill(d))}
-    count = len(shared)
+    global_dirs = sorted(p for p in GLOBAL.iterdir() if p.is_dir()) if GLOBAL.is_dir() else []
+    global_names = {name for d in global_dirs if (name := check_skill(d, explicit_only=True))}
+    shared = set()
+    for d in skill_dirs(ROOT):
+        if name := check_skill(d):
+            shared.add(name)
+            if name in global_names:
+                err(d, f"name {name!r} collides with the global skill global/{name}")
+    count = len(global_names) + len(shared)
     for ws in workspaces[1:]:
         for d in skill_dirs(ws):
             name = check_skill(d)
@@ -106,11 +130,13 @@ def main():
             count += 1
             if name in shared:
                 err(d, f"name {name!r} collides with the shared skill skills/{name}")
+            if name in global_names:
+                err(d, f"name {name!r} collides with the global skill global/{name}")
 
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    print(f"ok: {len(workspaces) - 1} workspaces, {count} skills")
+    print(f"ok: {len(workspaces) - 1} workspaces, {len(global_names)} global and {count} total skills")
     return 0
 
 

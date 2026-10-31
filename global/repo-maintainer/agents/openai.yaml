@@ -1,0 +1,5 @@
+interface:
+  short_description: "Timer-driven maintainer for one GitHub repo"
+
+policy:
+  allow_implicit_invocation: false

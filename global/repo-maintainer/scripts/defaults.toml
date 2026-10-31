@@ -1,0 +1,65 @@
+# Defaults for every maintained repo. ~/.config/repo-maintainer/<slug>.toml overrides any key.
+# Models per task are in models.toml next to SKILL.md.
+# Schedules are systemd OnCalendar expressions; rerun `maintainer.py install <slug>` after changing one.
+
+agent = "claude"                              # claude or codex
+forge = "github"                              # github, forgejo or git; `maintainer.py add` detects it
+report_dir = "~/Documents/maintainer-reports" # daily reports land in <report_dir>/<YYYY-MM-DD>/<slug>.md
+branch_prefix = "maintainer/"                 # every branch the agent creates starts with this
+checks = []                                   # commands that verify a change, e.g. ["cargo test"]; empty: the agent reads the CI config
+keep_run_days = 30                            # run directories in ~/.local/state/repo-maintainer/<slug>/runs are deleted after this
+
+# Other people's PRs, and the agent's own PRs. GitHub only.
+[prs]
+enabled = true
+schedule = "hourly"
+post_reviews = false     # post review comments on other people's PRs; false keeps reviews in the daily report
+max_per_run = 10         # PRs handled per run; the rest wait for the next one
+stale_days = 30          # open PRs idle this long are flagged in the daily report
+pending_grace_hours = 6  # stop waiting for checks that stay pending this long
+timeout_minutes = 30
+budget_usd = 5.0         # Claude only: --max-budget-usd per run
+
+# Dependency bot PRs. GitHub only.
+[deps]
+enabled = true
+schedule = "*-*-* 08,14,20:00"
+bots = ["app/dependabot"]
+merge = ["patch", "minor", "major"] # update types the agent may merge; majors also need a release-notes review
+merge_method = "squash"             # squash, merge or rebase
+rebase_conflicts = true             # comment "@dependabot rebase" on conflicting PRs
+local_checks_without_ci = true      # for PRs without CI checks, run `checks` locally before merging
+max_per_run = 10
+pending_grace_hours = 6
+timeout_minutes = 30
+budget_usd = 5.0
+
+# Forks only (any config with `upstream`). See references/sync.md for the fork model.
+[sync]
+enabled = true
+schedule = "*-*-* 06:30"
+mirror = ""          # branch kept as a clean mirror of upstream_branch, only ever fast-forwarded; "" if none
+integration = ""     # branch that merges every feature branch, e.g. "features-master"; "" if none
+features = []        # feature branches to keep current; empty: every branch on the remote with commits upstream lacks
+skip = ["bench/*"]   # branches never refreshed or merged into integration
+update_local = true  # afterwards, fast-forward local branches (in their worktrees) that are behind and clean
+timeout_minutes = 120
+budget_usd = 10.0
+
+# Inefficiencies in the code, build and CI.
+[scan]
+enabled = true
+schedule = "Mon *-*-* 10:00"
+mode = "pr"       # "pr": fix the best finding and open a PR; "report": record findings only
+max_open_prs = 2  # no new improvement PRs while this many are still open
+max_new_prs = 1   # improvement PRs opened per run
+focus = []        # e.g. ["performance", "CI time"]; empty: everything
+exclude = []      # paths to leave alone, e.g. ["vendor/", "docs/"]
+timeout_minutes = 90
+budget_usd = 15.0
+
+[report]
+time = "23:50"     # daily report time; today's report isn't written before it
+catch_up_days = 7  # days missed while the machine was off are reported, up to this far back
+timeout_minutes = 15
+budget_usd = 1.0
