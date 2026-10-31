@@ -10,7 +10,7 @@ The user started you inside their checkout of the repo to maintain. You're worki
    - Timer runs work directly in this checkout.
    - A run doesn't start while the checkout has uncommitted changes to tracked files, or a merge or rebase in progress. It's recorded as blocked, and the daily report says so.
    - During a run, the checkout sits on a detached HEAD. Afterwards the runner switches back to whatever was checked out, and stashes anything the agent left uncommitted.
-   - The agent's own branches all start with `maintainer/`.
+   - The agent's own branches all start with `branch_prefix`, which is `maintainer/` by default.
 3. **Add the repo.** Run `maintainer.py add` from the checkout, adding `--agent codex` for Codex. It uses the `origin` remote unless given `--remote`, and works out:
    - **The forge:** GitHub; Forgejo, when an `fj` login points at the remote's server; otherwise plain git.
    - **Whether it's a fork:** from GitHub's parent, a remote named `upstream`, or `--upstream <url>`.

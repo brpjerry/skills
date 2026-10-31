@@ -44,7 +44,7 @@ Use only the summaries, the context and your lookups. Don't invent activity, and
 - items under Needs attention in the summaries, unless your lookup shows they're resolved
 - `failed` and `timeout` runs (put the note in plain words)
 - tasks in `paused`
-- `blocked` runs whose reason is about the checkout (uncommitted changes, a merge in progress), since the owner has to clear it before work resumes
+- `blocked` runs that wait on the owner: the checkout has uncommitted changes or a merge in progress, or scan has improvement PRs waiting for review
 - runs with `denied` above zero (say which task, and that `<run_dir>/denied.json` lists the refused actions)
 - PRs in `open_prs` with `days_idle` of at least `stale_days`, as one grouped item
 

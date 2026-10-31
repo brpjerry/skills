@@ -48,7 +48,6 @@ FORGES = ("github", "forgejo", "git")
 MARKER = "<!-- repo-maintainer -->"
 LOCK_WAIT_MINUTES = 180
 REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
-GITHUB_URL = re.compile(r"github\.com[:/]+([A-Za-z0-9-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 WRITE_ACCESS = ("ADMIN", "MAINTAIN", "WRITE")
 DEFAULT_PORTS = {"https": 443, "http": 80, "ssh": 22, "git": 9418}
 
@@ -57,10 +56,12 @@ CLAUDE_DENY = [
     "Bash(gh auth *)", "Bash(gh secret *)", "Bash(gh variable *)", "Bash(gh ssh-key *)", "Bash(gh gpg-key *)",
     "Bash(gh repo delete *)", "Bash(gh repo edit *)", "Bash(gh repo archive *)", "Bash(gh repo rename *)",
     "Bash(gh release create *)", "Bash(gh release delete *)", "Bash(gh workflow disable *)",
-    "Bash(gh pr merge * --admin*)", "Bash(fj auth *)", "Bash(fj repo delete *)", "Bash(fj release *)",
-    "Bash(fj tag *)", "Bash(git push --force *)", "Bash(git push -f *)", "Bash(git push * --force)",
-    "Bash(git push * -f)", "Bash(git push --delete *)", "Bash(git push -d *)", "Bash(git push * --delete *)",
-    "Bash(git push * -d *)", "Bash(sudo *)",
+    "Bash(gh pr merge * --admin*)", "Bash(gh pr merge --admin*)", "Bash(fj auth *)", "Bash(fj repo delete *)",
+    "Bash(fj release *)", "Bash(fj tag *)", "Bash(git push --force *)", "Bash(git push -f *)",
+    "Bash(git push * --force)", "Bash(git push * --force *)", "Bash(git push * -f)", "Bash(git push * -f *)",
+    "Bash(git push * +*)", "Bash(git push * :*)", "Bash(git push --mirror*)", "Bash(git push * --mirror*)",
+    "Bash(git push --delete *)", "Bash(git push -d *)", "Bash(git push * --delete *)", "Bash(git push * -d *)",
+    "Bash(sudo *)",
 ]
 
 # Files a dependency update may change: manifests, lockfiles, workflow and container files.
@@ -84,22 +85,31 @@ IN_PROGRESS = {"MERGE_HEAD": ("merge", "--abort"), "rebase-merge": ("rebase", "-
                "rebase-apply": ("rebase", "--abort"), "CHERRY_PICK_HEAD": ("cherry-pick", "--abort"),
                "REVERT_HEAD": ("revert", "--abort"), "BISECT_LOG": ("bisect", "reset")}
 
-# Children never wait on a prompt or an editor.
-ENV = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_EDITOR="true", GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1")
+# Children never wait on a prompt or an editor, and never inherit a repo from whatever started the runner
+# (git exports these to hooks): every git command names its checkout with -C.
+GIT_LOCAL_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
+                  "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_NAMESPACE")
+ENV = {k: v for k, v in os.environ.items() if k not in GIT_LOCAL_VARS} | {
+    "GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true", "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1"}
 
 
 class Failure(Exception):
     """Stops a run; it's recorded as failed."""
 
 
-def sh(cmd, cwd=None, check=True, timeout=600):
+def sh(cmd, cwd=None, check=True, timeout=600, strip=True):
     try:
         p = subprocess.run(cmd, cwd=cwd, env=ENV, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise Failure(f"`{' '.join(cmd[:4])}` timed out after {timeout}s")
     if check and p.returncode:
         raise Failure(f"`{' '.join(cmd[:4])}` exited {p.returncode}: {(p.stderr or p.stdout).strip()[-400:]}")
-    return p.stdout.strip()
+    return p.stdout.strip() if strip else p.stdout
+
+
+def nul_list(out):
+    """Paths from -z output, kept exactly (no stripping: a name may start with a space)."""
+    return [p for p in out.split("\0") if p]
 
 
 def gh(*args, **kw):
@@ -139,13 +149,16 @@ def merge(base, over):
 
 
 def slugify(repo):
-    """owner_name from owner/name, or from host/owner/name for repos outside GitHub."""
-    return "_".join(repo.lower().split("/")[-2:])
+    """owner_name on GitHub, host_owner_name elsewhere, so the same owner/name on two hosts can't collide."""
+    return "_".join(repo.lower().split("/"))
 
 
 def github_repo(url):
-    m = GITHUB_URL.search(url.strip())
-    return m.group(1) if m else None
+    """owner/name if `url` is a github.com remote, else None."""
+    parsed = parse_remote(url)
+    if parsed and parsed[0].lower() == "github.com" and REPO_RE.fullmatch(parsed[2]):
+        return parsed[2]
+    return None
 
 
 def parse_remote(url):
@@ -313,11 +326,22 @@ def check_checkout(cfg, repo):
     if not repo.checkout.is_dir():
         raise Failure(f"the checkout {repo.checkout} doesn't exist")
     url = repo.git("config", "--get", f"remote.{cfg['remote']}.url", check=False)
-    want = cfg["repo"] if cfg["forge"] == "github" else cfg["repo"].split("/", 1)[1]
-    have = github_repo(url) if cfg["forge"] == "github" else (parse_remote(url) or (None, None, None))[2]
-    if (have or "").lower() != want.lower():
+    if (remote_identity(cfg, url) or "").lower() != cfg["repo"].lower():
         raise Failure(f"remote {cfg['remote']} in {repo.checkout} isn't {cfg['repo']} ({url or 'missing'})")
     return f"the checkout can't be used: {why}" if (why := dirty(repo)) else None
+
+
+def remote_identity(cfg, url):
+    """The repo a remote URL points at, in the config's form: owner/name on GitHub, host/owner/name
+    elsewhere, with a Forgejo host named as its fj login, so another server's same path doesn't match."""
+    if cfg["forge"] == "github":
+        return github_repo(url)
+    if not (parsed := parse_remote(url)):
+        return None
+    host = parsed[0]
+    if cfg["forge"] == "forgejo":
+        host = forgejo_host(host) or host
+    return f"{host}/{parsed[2]}"
 
 
 def fetch(cfg, repo):
@@ -328,7 +352,7 @@ def fetch(cfg, repo):
 
 
 def untracked(repo):
-    return sorted(filter(None, repo.git("ls-files", "--others", "--exclude-standard", "-z").split("\0")))
+    return sorted(nul_list(repo.git("ls-files", "--others", "--exclude-standard", "-z", strip=False)))
 
 
 def position(repo):
@@ -343,23 +367,28 @@ def restore(repo, pos, label):
     for marker in operations(repo):
         repo.git(*IN_PROGRESS[marker], check=False)
         notes.append(f"undid a {IN_PROGRESS[marker][0]} the agent left")
-    changed = set(filter(None, repo.git("diff", "--name-only", "-z", "HEAD").split("\0")))
+    changed = set(nul_list(repo.git("diff", "--name-only", "-z", "HEAD", strip=False)))
     left = sorted(changed | (set(untracked(repo)) - set(pos["untracked"])))
-    if left:
-        repo.git("stash", "push", "--include-untracked", "-m", f"{SKILL}: left by {label}", "--", *left)
+    if left:  # literal pathspecs, so a name like `*.txt` can't also select the owner's files
+        repo.git("--literal-pathspecs", "stash", "push", "--include-untracked", "-m", f"{SKILL}: left by {label}", "--", *left)
         notes.append(f"stashed {len(left)} files the agent left uncommitted (see git stash list)")
     repo.git("switch", "--quiet", *(["--detach"] if pos["detached"] else []), pos["head"])
     return notes
 
 
-def recover(repo, state):
-    """Finish putting the checkout back after a run that was killed before it could."""
-    pos = state.pop("position", None)
+def recover(cfg, repo, state):
+    """Finish putting the checkout back after a run that was killed before it could. The agent works on a
+    detached HEAD or its own branches, so any other branch checked out means the owner has moved on."""
+    pos = state.get("position")
     if not pos:
         return None
-    if repo.git("symbolic-ref", "--quiet", "HEAD", check=False):
-        return None  # the owner has moved on since; leave it to them
-    return "; ".join(["recovered from an interrupted run"] + restore(repo, pos, "an interrupted run"))
+    branch = repo.git("symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    if branch and not branch.startswith(cfg["branch_prefix"]):
+        state.pop("position")
+        return None
+    notes = restore(repo, pos, "an interrupted run")
+    state.pop("position")  # only once it's back, so a failed recovery is tried again next run
+    return "; ".join(["recovered from an interrupted run"] + notes)
 
 
 def ancestor(repo, a, b):
@@ -458,17 +487,24 @@ def is_mine(pr, cfg, login):
             and pr["headRefName"].startswith(cfg["branch_prefix"]))
 
 
-def fingerprint(pr, ignore=()):
-    """Changes when a PR needs another look: new commits, finished checks, a conflict, a
-    review decision, or a comment or review the agent didn't write."""
+def talk_key(pr, ignore=()):
+    """The comments and reviews on a PR the agent didn't write, inline ones too when fetched. Their text
+    is included, so an edited comment counts as new feedback."""
+    items = (pr.get("comments") or []) + (pr.get("reviews") or []) + (pr.get("review_comments") or [])
     talk = sorted(
-        x.get("id") or "" for x in (pr.get("comments") or []) + (pr.get("reviews") or [])
+        json.dumps([x.get("id"), x.get("body") or ""]) for x in items
         if MARKER not in (x.get("body") or "")
         and not (x.get("body") or "").lstrip().startswith("@dependabot")
-        and (x.get("author") or {}).get("login") not in ignore
+        and (x.get("author") or x.get("user") or {}).get("login") not in ignore
     )
+    return hashlib.sha256(json.dumps(talk).encode()).hexdigest()[:16]
+
+
+def fingerprint(pr, ignore=()):
+    """Changes when a PR needs another look: new commits, finished checks, a conflict, a
+    review decision, or new or edited feedback the agent didn't write."""
     key = [pr["headRefOid"], pr["baseRefName"], check_state(pr)[0], pr.get("mergeable") == "CONFLICTING",
-           pr.get("reviewDecision"), pr["isDraft"], talk]
+           pr.get("reviewDecision"), pr["isDraft"], talk_key(pr, ignore)]
     return hashlib.sha256(json.dumps(key).encode()).hexdigest()[:16]
 
 
@@ -528,6 +564,10 @@ def verify_bot_pr(cfg, pr):
             problems.append(f"commit {c['sha'][:10]} is by {who}, not the bot")
         elif not c["commit"]["verification"]["verified"]:
             problems.append(f"commit {c['sha'][:10]} has no verified signature")
+        elif (c.get("committer") or {}).get("login") not in logins | {"web-flow"}:
+            # Anyone can claim the bot's author email; GitHub only signs as web-flow for the bot itself.
+            problems.append(f"commit {c['sha'][:10]} was committed by "
+                            f"{(c.get('committer') or {}).get('login') or 'an unknown account'}, not the bot or GitHub")
     if not commits or commits[-1]["sha"] != pr["headRefOid"]:
         problems.append("head moved while checking; it's checked again next run")
     other = [f for f in files if not DEP_FILE.search(f)]
@@ -561,30 +601,43 @@ class Ctx:
         self._prs = None
 
     def prs(self):
-        """Open PRs on GitHub; empty elsewhere, where the runner doesn't read PRs."""
+        """Open GitHub PRs by the owner's account (which opens the agent's) or a dependency bot. The skill
+        reads no one else's. Empty off GitHub, where the runner doesn't read PRs."""
         if self.cfg["forge"] != "github":
             return []
         if self._prs is None:
-            self._prs = gh_json("pr", "list", "-R", self.cfg["repo"], "--state", "open", "--limit", "200",
-                                "--json", PR_FIELDS)
+            authors = [a for a in (self.login, *self.cfg["deps"]["bots"]) if a]
+            self._prs = [p for a in authors for p in gh_json(
+                "pr", "list", "-R", self.cfg["repo"], "--state", "open", "--limit", "500", "--author", a,
+                "--json", PR_FIELDS)]
         return self._prs
 
 
 def gate_prs(cfg, repo, state, ctx):
     """The agent's own PRs. Other people's PRs aren't this skill's to review; bot PRs are `deps`."""
     prs = [p for p in ctx.prs() if is_mine(p, cfg, ctx.login)]
-    todo = changed_prs(prs, state.setdefault("prs", {}), state.setdefault("prs_pending", {}),
-                       cfg["prs"]["pending_grace_hours"], ctx.now)
+    for pr in prs:  # replies in inline review threads aren't part of `gh pr list`
+        pr["review_comments"] = gh_pages(f"repos/{cfg['repo']}/pulls/{pr['number']}/comments")
+    seen, todo = state.setdefault("prs", {}), []
+    for pr, fp, prev in changed_prs(prs, seen, state.setdefault("prs_pending", {}),
+                                    cfg["prs"]["pending_grace_hours"], ctx.now):
+        talk = talk_key(pr)
+        if (talk == (prev or {}).get("talk", talk_key({})) and check_state(pr)[0] in ("success", "none")
+                and pr.get("mergeable") != "CONFLICTING" and pr.get("reviewDecision") != "CHANGES_REQUESTED"):
+            # Only new commits, usually its own push, and their checks passed: nothing to look after.
+            seen[str(pr["number"])] = {"fp": fp, "head": pr["headRefOid"], "talk": talk}
+        else:
+            todo.append((pr, fp, prev, talk))
     if not todo:
-        return Gate("skipped", f"{len(prs)} open PRs of yours, none changed")
+        return Gate("skipped", f"{len(prs)} open PRs of yours, none needing a look")
     todo.sort(key=lambda x: x[0]["updatedAt"])
     todo = todo[:cfg["prs"]["max_per_run"]]
 
     def commit():
-        for pr, fp, _ in todo:
-            state["prs"][str(pr["number"])] = {"fp": fp, "head": pr["headRefOid"]}
+        for pr, fp, _, talk in todo:
+            seen[str(pr["number"])] = {"fp": fp, "head": pr["headRefOid"], "talk": talk}
 
-    items = [dict(pr_facts(pr, cfg, ctx.login), last_seen_head=prev and prev["head"]) for pr, _, prev in todo]
+    items = [dict(pr_facts(pr, cfg, ctx.login), last_seen_head=prev and prev["head"]) for pr, _, prev, _ in todo]
     return Gate("work", f"{len(items)} of your PRs to look after", {"prs": items}, commit)
 
 
@@ -681,15 +734,17 @@ def gate_scan(cfg, repo, state, ctx):
         mine = [{k: p.get(k) for k in ("number", "title", "url")}
                 for p in ctx.prs() if is_mine(p, cfg, ctx.login) and p["headRefName"].startswith(prefix)]
         closed = [p for p in gh_json("pr", "list", "-R", cfg["repo"], "--state", "closed", "--limit", "100",
-                                     "--json", "number,title,url,headRefName,author,mergedAt,closedAt")
-                  if p["author"]["login"] == ctx.login and p["headRefName"].startswith(prefix)]
-    else:  # without a PR API, an unmerged improvement branch still on the remote counts as open
+                                     "--author", ctx.login, "--json", "number,title,url,headRefName,mergedAt,closedAt")
+                  if p["headRefName"].startswith(prefix)]
+    else:  # without a PR API, an improvement branch still on the remote counts as open until it's merged
         mine = [{"branch": r.split("/", 1)[1]} for r in
                 repo.git("for-each-ref", "--format=%(refname:short)", f"refs/remotes/{cfg['remote']}/{prefix}*").split()
-                if not ancestor(repo, r, scan_ref)]
+                if not ancestor(repo, r, scan_ref)  # nor rebase- or single-commit squash-merged
+                and any(c.startswith("+") for c in repo.git("cherry", scan_ref, r).splitlines())]
         closed = []
     if s["mode"] == "pr" and len(mine) >= s["max_open_prs"]:
-        return Gate("skipped", f"{len(mine)} improvement branches still open")
+        # Waiting on the owner, not idle: recorded as blocked so the daily report shows it.
+        return Gate("blocked", f"{len(mine)} improvement PRs or branches wait for your review")
     if s["mode"] == "report" and head == last:
         return Gate("skipped", "no new commits since the last scan")
     brief = lambda p: {k: p.get(k) for k in ("number", "title", "url", "closedAt")}
@@ -764,7 +819,7 @@ def gate_report(cfg, repo, state, ctx):
         if ctx.dry_run:
             return Gate("done", f"would write a report without an agent for {day}")
         mark()
-        text = quiet_report(cfg, repo, day, done, skipped, blocked)
+        text = quiet_report(cfg, repo, day, done, skipped, blocked, standing_attention(cfg, ctx, state))
         return Gate("done", f"no agent runs on {day}: {publish(cfg, repo, day, text)}")
 
     def after(run_dir):
@@ -800,17 +855,33 @@ def tally(skipped, blocked):
     return lines
 
 
-def quiet_report(cfg, repo, day, done, skipped, blocked):
+def standing_attention(cfg, ctx, state):
+    """What needs the owner whether or not anything ran today: PRs of the skill's left idle, and tasks
+    backing off after failures. A quiet day's report lists these without starting an agent."""
+    items = []
+    stale = [p for p in open_pr_snapshot(cfg, ctx) or [] if p["days_idle"] >= cfg["prs"]["stale_days"]]
+    if stale:
+        items.append("**Idle PRs:** " + ", ".join(f"[#{p['number']}]({p['url']}) {p['title']} ({p['days_idle']} days)"
+                                              for p in stale))
+    for t in paused_tasks(state):
+        items.append(f"**{t['task']} is backing off** after {t['failures_in_a_row']} failures in a row: {t['last_error']}")
+    return items
+
+
+def quiet_report(cfg, repo, day, done, skipped, blocked, attention=()):
     """A report for a day no agent ran: only the runner acted, if anything."""
     if failed := sum(r["status"] in ("failed", "timeout") for r in done):
         verdict = f"Needs attention: {failed} runs failed; see Runs below."
+    elif attention:
+        verdict = "Nothing new ran into trouble, but some things still need you; see below."
     elif done:
         verdict = "No agent was needed; the runner handled what came up."
     elif blocked:
         verdict = "Nothing was done; some runs couldn't start."
     else:
         verdict = "Quiet day: nothing needed doing."
-    body = "\n\n".join([f"# {cfg['repo']}: {day}", verdict])
+    body = "\n\n".join([f"# {cfg['repo']}: {day}", verdict]
+                       + (["## Needs your attention", "\n".join(f"- {a}" for a in attention)] if attention else []))
     return body + "\n\n" + (runs_section(cfg, repo, done, skipped, blocked) if done else "\n\n".join(tally(skipped, blocked)) + "\n")
 
 
@@ -948,6 +1019,19 @@ def parse_codex(run_dir):
     return info, error
 
 
+def stop_group(p, grace=30):
+    """Stop the agent's whole process group: SIGTERM, then SIGKILL for anything still there after `grace`."""
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(p.pid, signal.SIGTERM)
+    try:
+        p.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(p.pid, signal.SIGKILL)
+    p.wait()
+
+
 def run_agent(cfg, repo, task, run_dir, start):
     """Start the agent and wait for it. Returns (status, error note or None, record fields)."""
     m = model_for(cfg, task)
@@ -959,16 +1043,11 @@ def run_agent(cfg, repo, task, run_dir, start):
         try:
             rc = p.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            os.killpg(p.pid, signal.SIGTERM)
-            try:
-                p.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                os.killpg(p.pid, signal.SIGKILL)
-                p.wait()
             rc = None
         finally:
-            if p.poll() is None:  # the runner itself is being stopped
-                os.killpg(p.pid, signal.SIGTERM)
+            # On a timeout, or when the runner itself is stopped, end the agent before the checkout is
+            # restored. Either way, end anything it left running: a CLI can exit before its tool processes.
+            stop_group(p)
     info, error = (parse_claude if cfg["agent"] == "claude" else parse_codex)(run_dir)
     fields.update(info)
     if rc is None:
@@ -997,8 +1076,8 @@ def base_context(cfg, repo, task, ctx, run_dir):
 
 
 def agent_run(cfg, repo, task, ctx, gate, state, start):
-    """Run the agent for a gate with work, in the checkout on a detached HEAD at the fetched default
-    branch, then put the checkout back. Returns (status, note, record fields)."""
+    """Run the agent for a gate with work, in the checkout on a detached HEAD at the fetched default branch
+    (for a scan, at what it scans), then put the checkout back. Returns (status, note, record fields)."""
     suffix = f"-{ctx.day}" if task == "report" else ""
     run_dir = repo.runs_dir / start.date().isoformat() / f"{start:%H%M%S}-{task}{suffix}"
     run_dir.mkdir(parents=True)
@@ -1008,7 +1087,7 @@ def agent_run(cfg, repo, task, ctx, gate, state, start):
     if task in CHECKOUT_TASKS:
         pos = state["position"] = position(repo)
         repo.save(state)  # so a killed run can still be undone by the next one
-        repo.git("switch", "--quiet", "--detach", base_ref(cfg))
+        repo.git("switch", "--quiet", "--detach", gate.context["scan_ref"] if task == "scan" else base_ref(cfg))
     label = f"the {task} run in {run_dir.name}"
     try:
         status, error, fields = run_agent(cfg, repo, task, run_dir, start)
@@ -1054,7 +1133,7 @@ def run_task(cfg, repo, task, ctx, args):
     state, fields = repo.state(), {}
     try:
         until = None if args.force else paused_until(state, task, start)
-        if task in CHECKOUT_TASKS and not args.dry_run and (note := recover(repo, state)):
+        if task in CHECKOUT_TASKS and not args.dry_run and (note := recover(cfg, repo, state)):
             fields["checkout"] = note
         if until:
             status, note = "blocked", f"paused after repeated failures until {until:%Y-%m-%d %H:%M}"
@@ -1078,6 +1157,8 @@ def run_task(cfg, repo, task, ctx, args):
                     status, note = ("done" if status == "skipped" else status), "; ".join([note, *moved])
     except Failure as e:
         status, note = "failed", str(e)
+    except Exception as e:  # a bug or an unexpected reply: still recorded, reported and backed off
+        status, note = "failed", f"{type(e).__name__}: {e}"
     print(f"{cfg['slug']} {task}: {status}: {note}")
     if args.dry_run:
         return 0
@@ -1192,8 +1273,8 @@ Description={skill} {task} for {repo}
 [Service]
 Type=oneshot
 WorkingDirectory={checkout}
-Environment="PATH={path}"
-ExecStart="{python}" "{script}" run {slug} {task}
+Environment={path}
+ExecStart={python} {script} run {slug} {task}
 TimeoutStartSec={timeout}min
 Nice=10
 """
@@ -1210,6 +1291,17 @@ RandomizedDelaySec={delay}
 [Install]
 WantedBy=timers.target
 """
+
+
+def toml_str(value):
+    """`value` escaped for the inside of a TOML basic string ("..."); JSON's escapes are all valid TOML."""
+    return json.dumps(str(value), ensure_ascii=False)[1:-1]
+
+
+def unit_str(value, exec_line=False):
+    """`value` as one quoted systemd argument: % is a specifier, and ExecStart= also expands $."""
+    s = '"' + str(value).replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return s.replace("$", "$$") if exec_line else s
 
 
 def remote_head(url, cwd):
@@ -1278,15 +1370,17 @@ def cmd_add(args):
     repo = Repo(slug)
     if repo.config.exists() and not args.force:
         die(f"{repo.config} already exists; pass --force to overwrite it")
-    fmt = dict(skill=SKILL, repo=name, slug=slug, forge=forge, branch=branch, checkout=top, remote=remote,
-               agent=args.agent, defaults=SCRIPT.parent / "defaults.toml", script=SCRIPT, sync="",
-               upstream=UPSTREAM.format(url=upstream, branch=upstream_branch) if upstream else "")
+    fmt = dict(skill=SKILL, repo=toml_str(name), slug=slug, forge=forge, branch=toml_str(branch),
+               checkout=toml_str(top), remote=toml_str(remote), agent=args.agent,
+               defaults=SCRIPT.parent / "defaults.toml", script=SCRIPT, sync="",
+               upstream=UPSTREAM.format(url=toml_str(upstream), branch=toml_str(upstream_branch)) if upstream else "")
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     repo.config.write_text(CONFIG.format(**fmt))
     cfg, repo = load_config(slug)
     if upstream:
         mirror, integration = suggest_fork(cfg, repo)
-        repo.config.write_text(CONFIG.format(**fmt | {"sync": SYNC.format(mirror=mirror, integration=integration)}))
+        repo.config.write_text(CONFIG.format(**fmt | {
+            "sync": SYNC.format(mirror=toml_str(mirror), integration=toml_str(integration))}))
         cfg, repo = load_config(slug)
     print(f"wrote {repo.config} for {name} ({forge}), using remote {remote} in {top}")
     if upstream:
@@ -1307,14 +1401,14 @@ def unit_name(slug, task):
 def cmd_install(args):
     cfg, repo = load_config(find_slug(args.slug))
     slug, units = cfg["slug"], {}
-    esc = lambda s: str(s).replace("%", "%%")
     for task in TASKS:
         if not enabled(cfg, task):
             continue
         schedule = f"*-*-* {cfg['report']['time']}:00" if task == "report" else cfg[task]["schedule"]
         sh(["systemd-analyze", "calendar", schedule])  # fails on a bad expression
-        fmt = dict(skill=SKILL, task=task, repo=cfg["repo"], slug=slug, checkout=esc(repo.checkout),
-                   path=esc(os.environ["PATH"]), python=esc(sys.executable), script=esc(SCRIPT), schedule=schedule,
+        fmt = dict(skill=SKILL, task=task, repo=cfg["repo"], slug=slug, checkout=str(repo.checkout).replace("%", "%%"),
+                   path=unit_str("PATH=" + os.environ["PATH"]), python=unit_str(sys.executable, exec_line=True),
+                   script=unit_str(SCRIPT, exec_line=True), schedule=schedule,
                    timeout=LOCK_WAIT_MINUTES + cfg[task]["timeout_minutes"] + 30,
                    delay="0" if task == "report" else "5min")
         units[f"{unit_name(slug, task)}.service"] = SERVICE.format(**fmt)
@@ -1334,6 +1428,9 @@ def cmd_install(args):
         (UNIT_DIR / name).write_text(text)
     timers = [n for n in units if n.endswith(".timer")]
     sh(["systemctl", "--user", "daemon-reload"])
+    if not timers:
+        print(f"no tasks are enabled for {slug}; its timers are removed")
+        return 0
     sh(["systemctl", "--user", "enable", *timers])
     sh(["systemctl", "--user", "restart", *timers])
     print(sh(["systemctl", "--user", "list-timers", "--all", "--no-pager", *timers]))

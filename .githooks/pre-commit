@@ -1,2 +1,2 @@
 #!/bin/sh
-exec python3 scripts/check.py
+python3 scripts/check.py && exec python3 -m unittest discover -s tests -q

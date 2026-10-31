@@ -49,12 +49,13 @@ that folder.
 ## Working on the repo
 
 ```sh
-just setup                         # once per clone: run `just check` before each commit
+just setup                         # once per clone: run `just check` and `just test` before each commit
 just new-workspace <name>
 just new-skill <workspace> <name>  # use . as the workspace for a shared skill
 just new-global-skill <name>
 just link-global                   # after adding a global skill
 just check
+just test                          # tests in tests/, stdlib only
 ```
 
 ## Conventions

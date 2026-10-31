@@ -2,9 +2,9 @@
 
 This task looks after the PRs you opened on earlier runs (improvement PRs, review branches from a refresh). It doesn't review anyone else's PRs. The owner has an automatic reviewer for those, and Dependabot's PRs are handled by `deps`. Never review, comment on or push to a PR that isn't yours or a bot's.
 
-`context.json` lists, in `prs`, your PRs that changed since a run last handled them. A change means new commits, finished checks, a conflict, a new review decision, or a comment or review you didn't write. Each entry has these fields (`deps` uses the same ones):
+`context.json` lists, in `prs`, your PRs that changed since a run last handled them. A change means a conflict, failing checks, a new review decision, or a comment or review you didn't write, new or edited, including replies in inline review threads. New commits whose checks pass, such as your own push, don't start a run. Each entry has these fields (`deps` uses the same ones):
 
-- `number`, `title`, `url`, `author`, `branch`, `base`, `head` (head commit SHA), `created`, `updated`
+- `number`, `title`, `url`, `author`, `branch`, `base`, `head` (head commit SHA), `draft`, `created`, `updated`
 - `from_fork`: the branch lives in another repository
 - `checks`: `success`, `failure`, `none` (no CI), or `pending` (still running after the grace period); `failed_checks` names the failures
 - `conflicting`, `review_decision`

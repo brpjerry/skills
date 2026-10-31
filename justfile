@@ -4,13 +4,17 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     @just --list
 
-# Enable the repo's git hooks (once per clone)
+# Enable the repo's git hooks (once per clone): check and test before each commit
 setup:
     git config core.hooksPath .githooks
 
 # Validate workspace layout and SKILL.md frontmatter
 check:
     python3 scripts/check.py
+
+# Run the tests in tests/ (stdlib unittest, no network)
+test:
+    python3 -m unittest discover -s tests
 
 # Create a workspace: a directory you start claude/codex sessions in
 new-workspace name:
@@ -99,6 +103,7 @@ new-global-skill name:
 link-global:
     #!/usr/bin/env bash
     set -euo pipefail
+    shopt -s nullglob
     for src in "$PWD"/global/*/; do
         src=${src%/}; name=${src##*/}
         for dir in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills" "${CODEX_HOME:-$HOME/.codex}/skills"; do

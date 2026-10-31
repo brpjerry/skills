@@ -1,6 +1,6 @@
 # scan: find and fix inefficiencies
 
-`context.json` has:
+You start on a detached HEAD at `scan_ref`. `context.json` has:
 
 - `scan_ref`: what you're scanning: `base_ref`, or a fork's integration branch. `head` is its commit. `last_scan_head` is the commit the last scan saw, or null on the first scan.
 - `changes_since_last_scan`: `git diff --stat` between them
