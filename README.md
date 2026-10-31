@@ -22,7 +22,7 @@ codebases. `just link-global` symlinks each one into `~/.claude/skills` and
 
 | Global skill | What it does |
 |---|---|
-| `repo-maintainer` | Timer-driven maintainer for one repo (GitHub, Forgejo or plain git), run from your checkout of it. It reviews PRs, merges verified Dependabot PRs, refreshes forks (mirror, feature branches, integration branch), fixes inefficiencies, and writes a daily report. Runs are saved as sessions you can resume to ask for changes. Set it up with `/repo-maintainer setup` inside the checkout. |
+| `repo-maintainer` | Timer-driven maintainer for one repo (GitHub, Forgejo or plain git), run from your checkout of it. It merges verified Dependabot PRs (the only PRs it reviews), looks after its own PRs, refreshes forks (mirror, feature branches, integration branch), fixes inefficiencies, and writes a daily report. Runs are saved as sessions you can resume to ask for changes. Set it up with `/repo-maintainer setup` inside the checkout. |
 
 ## Layout
 

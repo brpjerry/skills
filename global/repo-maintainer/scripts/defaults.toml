@@ -9,13 +9,12 @@ branch_prefix = "maintainer/"                 # every branch the agent creates s
 checks = []                                   # commands that verify a change, e.g. ["cargo test"]; empty: the agent reads the CI config
 keep_run_days = 30                            # run directories in ~/.local/state/repo-maintainer/<slug>/runs are deleted after this
 
-# Other people's PRs, and the agent's own PRs. GitHub only.
+# The agent's own PRs: CI fixes, conflicts and feedback. It reviews no one else's. GitHub only.
 [prs]
 enabled = true
 schedule = "hourly"
-post_reviews = false     # post review comments on other people's PRs; false keeps reviews in the daily report
 max_per_run = 10         # PRs handled per run; the rest wait for the next one
-stale_days = 30          # open PRs idle this long are flagged in the daily report
+stale_days = 30          # its own and bot PRs left open this long are flagged in the daily report
 pending_grace_hours = 6  # stop waiting for checks that stay pending this long
 timeout_minutes = 30
 budget_usd = 5.0         # Claude only: --max-budget-usd per run

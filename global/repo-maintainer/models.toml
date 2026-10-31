@@ -4,7 +4,7 @@
 
 # Tier each task runs at.
 [tasks]
-prs = "lead"      # reviews other people's code and fixes its own PRs
+prs = "lead"      # fixes its own PRs and answers feedback on them
 deps = "lead"     # merge decisions, release notes for major bumps
 sync = "lead"     # upstream merge conflicts
 scan = "lead"     # finding and fixing inefficiencies

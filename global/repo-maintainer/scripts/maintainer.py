@@ -571,13 +571,13 @@ class Ctx:
 
 
 def gate_prs(cfg, repo, state, ctx):
-    prs = [p for p in ctx.prs() if p["author"]["login"] not in cfg["deps"]["bots"]]
+    """The agent's own PRs. Other people's PRs aren't this skill's to review; bot PRs are `deps`."""
+    prs = [p for p in ctx.prs() if is_mine(p, cfg, ctx.login)]
     todo = changed_prs(prs, state.setdefault("prs", {}), state.setdefault("prs_pending", {}),
-                       cfg["prs"]["pending_grace_hours"], ctx.now,
-                       include=lambda p: not p["isDraft"] or is_mine(p, cfg, ctx.login))
+                       cfg["prs"]["pending_grace_hours"], ctx.now)
     if not todo:
-        return Gate("skipped", f"{len(prs)} open PRs, none changed")
-    todo.sort(key=lambda x: (not is_mine(x[0], cfg, ctx.login), x[0]["updatedAt"]))
+        return Gate("skipped", f"{len(prs)} open PRs of yours, none changed")
+    todo.sort(key=lambda x: x[0]["updatedAt"])
     todo = todo[:cfg["prs"]["max_per_run"]]
 
     def commit():
@@ -585,8 +585,7 @@ def gate_prs(cfg, repo, state, ctx):
             state["prs"][str(pr["number"])] = {"fp": fp, "head": pr["headRefOid"]}
 
     items = [dict(pr_facts(pr, cfg, ctx.login), last_seen_head=prev and prev["head"]) for pr, _, prev in todo]
-    return Gate("work", f"{len(items)} PRs to look at",
-                {"prs": items, "policy": {"post_reviews": cfg["prs"]["post_reviews"]}}, commit)
+    return Gate("work", f"{len(items)} of your PRs to look after", {"prs": items}, commit)
 
 
 def gate_deps(cfg, repo, state, ctx):
@@ -733,10 +732,11 @@ def due_days(cfg, repo, state, t):
 
 
 def open_pr_snapshot(cfg, ctx):
+    """The open PRs this skill answers for: its own and the dependency bot's."""
     if cfg["forge"] != "github":
         return None
     try:
-        prs = ctx.prs()
+        prs = [p for p in ctx.prs() if is_mine(p, cfg, ctx.login) or p["author"]["login"] in cfg["deps"]["bots"]]
     except Failure:
         return None
     keep = ("number", "title", "url", "author", "draft", "checks", "conflicting", "review_decision", "yours")
@@ -880,8 +880,6 @@ def claude_settings(cfg, repo):
     if enabled(cfg, "deps") and cfg["deps"]["merge"]:
         allow.append(f"Dependency merges: merging Dependabot PRs in {name} with gh pr merge --match-head-commit once "
                      f"the runner verified them and their checks passed, and commenting @dependabot rebase on them.")
-    if enabled(cfg, "prs") and cfg["prs"]["post_reviews"]:
-        allow.append(f"PR reviews: posting comment-only reviews and replies on open PRs in {name}.")
     return {"autoMemoryEnabled": False, "autoMode": {
         "environment": [f"**Maintained repo**: this unattended session maintains {scope} for its owner, who set "
                         f"it up. The working directory is the owner's checkout of it, with {remote} as its remote. "
@@ -1165,9 +1163,6 @@ agent = "{agent}"  # claude or codex
 {upstream}
 # Commands that verify a change. Empty: the agent works them out from the CI config.
 # checks = ["cargo test", "cargo clippy -- -D warnings"]
-
-# [prs]
-# post_reviews = true         # post reviews on other people's PRs instead of only reporting them
 
 # [deps]
 # merge = ["patch", "minor"]  # leave major bumps for you

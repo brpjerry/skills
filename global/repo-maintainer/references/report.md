@@ -6,7 +6,7 @@ The runner writes quiet days' reports itself. You run when the day had activity.
 - `runs`: that day's runs that did something, each with `time`, `task`, `status` (`ok`, `done`, `failed` or `timeout`), `note`, `summary` (the path of that run's summary, or null), `run_dir`, and `denied` (actions auto mode refused). A `done` run was handled by the runner without an agent, such as a fork fast-forward, and its `note` says what happened.
 - `skipped`: how many runs per task found nothing to do
 - `blocked`: runs that couldn't start, with `task`, `reason` and `count`. Reasons include the checkout having uncommitted changes or a merge in progress, being offline, and backing off after failures.
-- `open_prs`: on GitHub, the repo's open PRs right now, with `days_open` and `days_idle`. Null elsewhere, or if GitHub couldn't be reached.
+- `open_prs`: on GitHub, your own and the dependency bot's PRs that are still open, with `days_open` and `days_idle`. Null elsewhere, or if GitHub couldn't be reached.
 - `stale_days`: PRs idle at least this long count as stale
 - `paused`: tasks backing off after repeated failures
 
@@ -32,7 +32,6 @@ Use only the summaries, the context and your lookups. Don't invent activity, and
 - **Merged:** ...
 - **Opened:** ...
 - **Updated:** ...
-- **Reviewed:** ...
 - **Synced:** ...
 
 ## Notes
