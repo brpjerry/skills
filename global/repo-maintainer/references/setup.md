@@ -26,7 +26,7 @@ The user started you inside their checkout of the repo to maintain. You're worki
    - `sync.timeout_minutes` and `sync.budget_usd`: a refresh merges every feature branch and then runs `checks` on the result. For many branches or a slow build, raise both. A run that times out pushes nothing and tries again later.
 5. **Settings.** Go through the settings that decide what the agent does, and write the user's choices to the config. Defaults and descriptions are in `scripts/defaults.toml` in this skill's directory, and models are in `models.toml`.
    - `checks`: suggest commands from the repo's CI workflows, justfile, Makefile, README or agent instructions, and confirm them with the user. For a fork with an integration branch, they should build what gets deployed. They run in the checkout, so use paths that work from there.
-   - GitHub only: `prs.post_reviews` (post reviews on other people's PRs under the user's account, or keep them in the report) and `deps.merge` (which update types to merge; majors only after a release-notes review).
+   - GitHub only: `deps.merge`, which update types to merge (majors only after a release-notes review). Tell the user the skill reviews no PRs but Dependabot's, and only looks after its own PRs beyond that.
    - `scan.mode`: open improvement PRs, or only record findings.
    - `report_dir`, the schedules, and `agent`, if the defaults don't suit.
 6. **Agent instructions.** Every run follows the checkout's own `CLAUDE.md` or `AGENTS.md`. Claude Code also reads those of parent directories. If the user's conventions for this repo aren't written down there, suggest adding them.
