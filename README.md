@@ -14,10 +14,21 @@ Both tools load skills from the directory they start in and from every parent
 up to the repo root. A session started at the repo root sees only the shared
 skills.
 
+**Global skills** in `global/` are the exception: they're meant for other
+codebases. `just link-global` symlinks each one into `~/.claude/skills` and
+`~/.codex/skills`, so every Claude Code and Codex session can use them, and
+`git pull` here updates them. They run only when invoked by name
+(`/<name>` in Claude Code, `$<name>` in Codex).
+
+| Global skill | What it does |
+|---|---|
+| `repo-maintainer` | Timer-driven maintainer for one repo (GitHub, Forgejo or plain git), run from your checkout of it. It reviews PRs, merges verified Dependabot PRs, refreshes forks (mirror, feature branches, integration branch), fixes inefficiencies, and writes a daily report. Runs are saved as sessions you can resume to ask for changes. Set it up with `/repo-maintainer setup` inside the checkout. |
+
 ## Layout
 
 ```
 .
+├── global/<name>/SKILL.md       # global skills, linked into ~/.claude/skills and ~/.codex/skills
 ├── skills/                      # shared skills, loaded in every workspace
 ├── .claude/skills -> ../skills
 ├── .agents/skills -> ../skills
@@ -41,6 +52,8 @@ that folder.
 just setup                         # once per clone: run `just check` before each commit
 just new-workspace <name>
 just new-skill <workspace> <name>  # use . as the workspace for a shared skill
+just new-global-skill <name>
+just link-global                   # after adding a global skill
 just check
 ```
 
@@ -53,5 +66,11 @@ just check
   fine. Codex-only metadata goes in `<skill>/agents/openai.yaml`.
 - Keep `AGENTS.md`/`CLAUDE.md` out of the repo root and keep shared skills few,
   because both load into every workspace session.
-- A workspace skill can't reuse a shared skill's name.
+- A workspace skill can't reuse a shared skill's name, and no skill can reuse a
+  global skill's name.
+- Global skills load into every session on the machine, so they must be
+  explicit-only: `disable-model-invocation: true` in `SKILL.md` and
+  `policy.allow_implicit_invocation: false` in `agents/openai.yaml`.
+  `just check` enforces both. They keep their state outside this repo (for
+  example under `~/.config` and `~/.local/state`).
 - Session output belongs in `<workspace>/work/`, which is gitignored.
