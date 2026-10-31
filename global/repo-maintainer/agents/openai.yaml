@@ -1,5 +1,5 @@
 interface:
-  short_description: "Timer-driven maintainer for one GitHub repo"
+  short_description: "Timer-driven maintainer for one repo on GitHub, Forgejo or plain git"
 
 policy:
   allow_implicit_invocation: false
