@@ -67,6 +67,14 @@ class Parsing(unittest.TestCase):
         self.assertEqual(m.remote_identity(cfg, "ssh://git@git.example.org/me/proj.git"), "git.example.org/me/proj")
         self.assertNotEqual(m.remote_identity(cfg, "ssh://git@other.example.org/me/proj.git"), cfg["repo"])
 
+    def test_forgejo_remote_by_ip_matches_its_login_host(self):
+        cfg = config(forge="forgejo", repo="localhost/me/proj")
+        self.assertEqual(m.remote_identity(cfg, "ssh://git@127.0.0.1:2222/me/proj.git"), "localhost/me/proj")
+        self.assertEqual(m.remote_identity(cfg, "ssh://git@localhost:2222/me/proj.git"), "localhost/me/proj")
+        self.assertNotEqual(m.remote_identity(cfg, "ssh://git@127.0.0.1:2222/me/other.git"), cfg["repo"])
+        with self.assertRaises(m.Failure):  # an unresolvable name says so instead of claiming a wrong remote
+            m.remote_identity(cfg, "ssh://git@no-such-host.invalid/me/proj.git")
+
     def test_toml_str_round_trips(self):
         for value in ['/home/u/a"b', "back\\slash\\t", "tab\there", "ünïcode"]:
             self.assertEqual(tomllib.loads(f'x = "{m.toml_str(value)}"')["x"], value)
@@ -235,6 +243,17 @@ class Reports(unittest.TestCase):
             state = {"failures": {"prs": {"count": count, "last": last.isoformat()}}}
             until = m.paused_until(state, "prs", later)
             self.assertEqual(until and (until - last).total_seconds() / 3600, hours)
+
+    def test_failed_publish_leaves_the_day_unreported(self):
+        cfg = config(forge="git", repo="git.example.org/me/proj", report_dir=str(Path(self.tmp.name) / "file-not-dir"))
+        state = {}  # (forge git: no PR lookups, so no network)
+        Path(cfg["report_dir"]).write_text("in the way")  # publish can't make a directory here
+        self.run_on("2026-10-30", "prs", "skipped")
+        ctx = m.Ctx(cfg, dry_run=False)
+        ctx.day, ctx.login = "2026-10-30", "me"
+        with self.assertRaises(OSError):
+            m.gate_report(cfg, self.repo, state, ctx)
+        self.assertNotIn("2026-10-30", state.get("reports", {}))
 
     def test_quiet_report_lists_standing_attention(self):
         text = m.quiet_report(config(), self.repo, "2026-10-31", [], {"prs": 3}, {}, ["**Idle PRs:** #4"])

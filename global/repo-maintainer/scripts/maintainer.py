@@ -333,15 +333,24 @@ def check_checkout(cfg, repo):
 
 def remote_identity(cfg, url):
     """The repo a remote URL points at, in the config's form: owner/name on GitHub, host/owner/name
-    elsewhere, with a Forgejo host named as its fj login, so another server's same path doesn't match."""
+    elsewhere, so another server's same path doesn't match."""
     if cfg["forge"] == "github":
         return github_repo(url)
     if not (parsed := parse_remote(url)):
         return None
-    host = parsed[0]
-    if cfg["forge"] == "forgejo":
-        host = forgejo_host(host) or host
+    host, configured = parsed[0], cfg["repo"].split("/", 1)[0]
+    if cfg["forge"] == "forgejo" and host.lower() != configured.lower() and same_server(host, configured):
+        host = configured  # the remote names the server another way, often by IP; the config uses its fj login
     return f"{host}/{parsed[2]}"
+
+
+def same_server(a, b):
+    """Whether two host names point at the same address. Asks only the resolver, not fj, so it can't
+    fail on anything the fetch itself doesn't need."""
+    try:
+        return socket.gethostbyname(a) == socket.gethostbyname(b)
+    except OSError as e:
+        raise Failure(f"couldn't resolve {a} and {b} to check they're the same server: {e}")
 
 
 def fetch(cfg, repo):
@@ -818,14 +827,16 @@ def gate_report(cfg, repo, state, ctx):
     if not any(r.get("session") for r in done):
         if ctx.dry_run:
             return Gate("done", f"would write a report without an agent for {day}")
-        mark()
         text = quiet_report(cfg, repo, day, done, skipped, blocked, standing_attention(cfg, ctx, state))
-        return Gate("done", f"no agent runs on {day}: {publish(cfg, repo, day, text)}")
+        dest = publish(cfg, repo, day, text)
+        mark()  # only once it's written, so a failed publish is retried
+        return Gate("done", f"no agent runs on {day}: {dest}")
 
     def after(run_dir):
         text = (run_dir / "report.md").read_text().rstrip() + "\n\n" + runs_section(cfg, repo, done, skipped, blocked)
+        dest = publish(cfg, repo, day, text)
         mark()
-        return f"report for {day}: {publish(cfg, repo, day, text)}"
+        return f"report for {day}: {dest}"
 
     return Gate("work", f"report for {day}", {
         "date": day,
