@@ -478,7 +478,11 @@ class Network(unittest.TestCase):
         self.assertEqual(m.unreachable(cfg, repo, "sync", wait_minutes=0), [])  # the fetch tries the upstream
         git(repo.checkout, "remote", "set-url", "origin", f"ssh://git@127.0.0.1:{closed}/me/proj.git")
         self.assertEqual(m.unreachable(cfg, repo, "sync", wait_minutes=0), [f"127.0.0.1:{closed}"])
-        self.assertEqual(m.unreachable(cfg, repo, "report", wait_minutes=0), [])  # off GitHub, reports read nothing remote
+        self.assertEqual(m.unreachable(cfg, repo, "report", "2026-11-04", wait_minutes=0), [])  # the runner writes it
+        repo.dir.mkdir(parents=True)
+        repo.record({"task": "scan", "date": "2026-11-04", "status": "ok", "session": "s"})
+        self.assertEqual(m.unreachable(cfg, repo, "report", "2026-11-04", wait_minutes=0),  # the agent writes it
+                         [f"127.0.0.1:{closed}"])
 
     def test_fetch_from_an_unreachable_upstream_is_offline(self):
         git(self.dir, "init", "-q", "--bare", "-b", "main", "origin.git")
@@ -494,7 +498,7 @@ class Network(unittest.TestCase):
         m.CONFIG_DIR.mkdir()
         (m.CONFIG_DIR / "example.org_me_proj.toml").write_text(
             f'repo = "example.org/me/proj"\nforge = "git"\nbranch = "main"\nremote = "origin"\n'
-            f'checkout = "{self.dir / "co"}"\nreport_dir = "{self.dir / "reports"}"\n')
+            f'checkout = "{m.toml_str(self.dir / "co")}"\nreport_dir = "{m.toml_str(self.dir / "reports")}"\n')
         cfg, repo = m.load_config("example.org_me_proj")
         repo.dir.mkdir(parents=True)
         return cfg, repo
@@ -530,7 +534,14 @@ class Network(unittest.TestCase):
         args = argparse.Namespace(slug="example.org_me_proj", task="report", dry_run=False, force=False, date=None)
         m.unreachable = lambda *a, **kw: ["example.org:22"]
         self.assertEqual(m.cmd_run(args), m.EX_TEMPFAIL)
-        self.assertEqual([r.get("day") for r in repo.runs() if r["task"] == "report"], days[:1])
+        reported = lambda: [r.get("day") for r in repo.runs() if r["task"] == "report"]
+        self.assertEqual(reported(), days[:1])
+        state = repo.state()  # still offline when the window runs out: the next day doesn't open a new one
+        state["offline"]["report"] = (m.now() - dt.timedelta(hours=m.OFFLINE_RETRY_HOURS + 1)).isoformat()
+        repo.save(state)
+        self.assertEqual(m.cmd_run(args), 0)
+        self.assertEqual(reported(), [days[0], days[0]])
+        self.assertNotIn("report", repo.state()["offline"])
         m.unreachable = lambda *a, **kw: []
         self.assertEqual(m.cmd_run(args), 0)
         self.assertEqual(sorted(repo.state()["reports"]), days)
