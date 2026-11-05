@@ -484,13 +484,14 @@ def reachable(host, port, deadline):
             time.sleep(15)
 
 
-def unreachable(cfg, repo, task, wait_minutes=5):
+def unreachable(cfg, repo, task, day=None, wait_minutes=5):
     """The forge, as host:port, if it doesn't answer within a few minutes (timers fire right after resume).
-    Off GitHub, a report reads nothing remote, so it doesn't wait. A fork's upstream is left to the fetch,
-    which reaches it the way git is configured to (SSH aliases, proxies, URL rewrites) and retries too."""
+    Off GitHub, a report the runner writes itself reads nothing remote, so it doesn't wait; one that starts
+    the agent does, with the forge standing in for the network. A fork's upstream is left to the fetch, which
+    reaches it the way git is configured to (SSH aliases, proxies, URL rewrites) and retries too."""
     if cfg["forge"] == "github":
         hosts = [("api.github.com", 443)]
-    elif task == "report":
+    elif task == "report" and not agent_report(repo, day):
         hosts = []
     else:
         remote = parse_remote(repo.git("config", "--get", f"remote.{cfg['remote']}.url", check=False) or "")
@@ -640,6 +641,7 @@ class Ctx:
         self.now = now()
         self.login = None
         self.day = None
+        self.offline = False  # whether the last task run couldn't reach a host it needed
         self._prs = None
 
     def prs(self):
@@ -814,6 +816,11 @@ def acted(run):
     return run["status"] not in ("skipped", "blocked")
 
 
+def agent_report(repo, day):
+    """Whether the agent writes the report for `day`: some run that day started one. Otherwise the runner does."""
+    return any(r.get("session") and acted(r) for r in repo.runs() if r["date"] == day and r["task"] != "report")
+
+
 def due_days(cfg, repo, state, t):
     """Days with runs that aren't reported yet, or that gained activity since their report."""
     first = (t - dt.timedelta(days=cfg["report"]["catch_up_days"])).date().isoformat()
@@ -857,7 +864,7 @@ def gate_report(cfg, repo, state, ctx):
     def mark():
         state.setdefault("reports", {})[day] = len(done)
 
-    if not any(r.get("session") for r in done):
+    if not agent_report(repo, day):
         if ctx.dry_run:
             return Gate("done", f"would write a report without an agent for {day}")
         text = quiet_report(cfg, repo, day, done, skipped, blocked, standing_attention(cfg, ctx, state))
@@ -1181,7 +1188,7 @@ def run_task(cfg, repo, task, ctx, args):
             fields["checkout"] = note
         if until:
             status, note = "blocked", f"paused after repeated failures until {until:%Y-%m-%d %H:%M}"
-        elif down := unreachable(cfg, repo, task):
+        elif down := unreachable(cfg, repo, task, ctx.day):
             raise Offline(f"can't reach {', '.join(down)}")
         elif task in CHECKOUT_TASKS and (reason := check_checkout(cfg, repo)):
             status, note = "blocked", reason
@@ -1205,6 +1212,7 @@ def run_task(cfg, repo, task, ctx, args):
         status, note = "failed", str(e)
     except Exception as e:  # a bug or an unexpected reply: still recorded, reported and backed off
         status, note = "failed", f"{type(e).__name__}: {e}"
+    ctx.offline = offline
     print(f"{cfg['slug']} {task}: {status}: {note}")
     if args.dry_run:
         return 0
@@ -1260,8 +1268,9 @@ def cmd_run(args):
         rc = 0
         for day in days:
             ctx.day = day
-            if (code := run_task(cfg, repo, "report", ctx, args)) == EX_TEMPFAIL:
-                return code  # the other days wait for the retry, rather than each waiting for the network
+            code = run_task(cfg, repo, "report", ctx, args)
+            if ctx.offline:  # the other days wait for the retry or the timer, so none reopens an expired window
+                return code or rc
             rc |= code
         if not args.dry_run:
             prune_runs(cfg, repo)
@@ -1527,9 +1536,11 @@ def cmd_status(args):
         for p in paused_tasks(state):
             print(f"  {p['task']} is backing off after {p['failures_in_a_row']} failures: {p['last_error']}")
         for task, since in state.get("offline", {}).items():
-            if t < (until := dt.datetime.fromisoformat(since) + dt.timedelta(hours=OFFLINE_RETRY_HOURS)):
-                print(f"  {task} has been offline since {since[:16].replace('T', ' ')}; "
-                      f"its unit retries offline runs until {until:%Y-%m-%d %H:%M}")
+            if t < dt.datetime.fromisoformat(since) + dt.timedelta(hours=OFFLINE_RETRY_HOURS):
+                pending = sh(["systemctl", "--user", "show", "--property", "SubState", "--value",
+                              f"{unit_name(slug, task)}.service"], check=False) == "auto-restart"
+                print(f"  {task} has been offline since {since[:16].replace('T', ' ')}"
+                      + ("; its unit will start it again" if pending else ""))
         for r in repo.runs()[-args.last:]:
             session = f"  [session {r['session']}]" if r.get("session") else ""
             print(f"  {r['start'][:16].replace('T', ' ')}  {r['task']:<6} {r['status']:<8} {r.get('note', '')}{session}")
