@@ -1,6 +1,7 @@
 # Defaults for every maintained repo. ~/.config/repo-maintainer/<slug>.toml overrides any key.
 # Models per task are in models.toml next to SKILL.md.
-# Schedules are systemd OnCalendar expressions; rerun `maintainer.py install <slug>` after changing one.
+# Schedules are systemd OnCalendar expressions; rerun `maintainer.py install <slug>` after changing one,
+# and after updating the skill, so the units get its current settings.
 
 agent = "claude"                              # claude or codex
 forge = "github"                              # github, forgejo or git; `maintainer.py add` detects it
