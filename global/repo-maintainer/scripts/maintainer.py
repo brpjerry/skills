@@ -47,6 +47,9 @@ GITHUB_TASKS = ("prs", "deps")
 FORGES = ("github", "forgejo", "git")
 MARKER = "<!-- repo-maintainer -->"
 LOCK_WAIT_MINUTES = 180
+EX_TEMPFAIL = 75             # exit status of a run that couldn't reach a host it needs; its unit starts it again later
+OFFLINE_RETRY_HOURS = 12     # how long a task stays offline before it waits for its timer instead
+RETRY_DELAYS = (15, 60, 180)  # seconds before each retry of a network command that hit a network error
 REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
 WRITE_ACCESS = ("ADMIN", "MAINTAIN", "WRITE")
 DEFAULT_PORTS = {"https": 443, "http": 80, "ssh": 22, "git": 9418}
@@ -84,6 +87,13 @@ PR_FIELDS = ("number,title,url,author,headRefName,headRefOid,baseRefName,isDraft
 IN_PROGRESS = {"MERGE_HEAD": ("merge", "--abort"), "rebase-merge": ("rebase", "--abort"),
                "rebase-apply": ("rebase", "--abort"), "CHERRY_PICK_HEAD": ("cherry-pick", "--abort"),
                "REVERT_HEAD": ("revert", "--abort"), "BISECT_LOG": ("bisect", "reset")}
+# What git, gh and fj print when a host can't be reached, and, in NETWORK_ERROR, also when a connection or the
+# server fails partway. Both are retried; only one that still can't reach its host makes the run offline.
+UNREACHABLE = re.compile(r"could not resolve|unable to look up|name resolution|name or service not known|dns error|"
+                         r"network is unreachable|no route to host|connection refused|connection timed out|"
+                         r"failed to connect|could not connect|error connecting to", re.I)
+NETWORK_ERROR = re.compile(UNREACHABLE.pattern + r"|connection reset|connection closed|timed? ?out|hung up unexpectedly|"
+                           r"early eof|unexpected disconnect|rpc failed|tls handshake|(http|returned error:?) 5\d\d", re.I)
 
 # Children never wait on a prompt or an editor, and never inherit a repo from whatever started the runner
 # (git exports these to hooks): every git command names its checkout with -C.
@@ -97,13 +107,26 @@ class Failure(Exception):
     """Stops a run; it's recorded as failed."""
 
 
-def sh(cmd, cwd=None, check=True, timeout=600, strip=True):
-    try:
-        p = subprocess.run(cmd, cwd=cwd, env=ENV, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise Failure(f"`{' '.join(cmd[:4])}` timed out after {timeout}s")
+class Offline(Failure):
+    """Stops a run that can't reach a host it needs; it's recorded as blocked, and its unit tries again later."""
+
+
+def sh(cmd, cwd=None, check=True, timeout=600, strip=True, retry=False):
+    """Run a command. With `retry`, for network commands, a network error is retried after each of
+    RETRY_DELAYS, and one that still can't reach its host raises Offline."""
+    for delay in [*RETRY_DELAYS, None] if retry else [None]:
+        try:
+            p = subprocess.run(cmd, cwd=cwd, env=ENV, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                               timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise Failure(f"`{' '.join(cmd[:4])}` timed out after {timeout}s")
+        err = (p.stderr or p.stdout).strip()
+        if not p.returncode or delay is None or not NETWORK_ERROR.search(err):
+            break
+        time.sleep(delay)
     if check and p.returncode:
-        raise Failure(f"`{' '.join(cmd[:4])}` exited {p.returncode}: {(p.stderr or p.stdout).strip()[-400:]}")
+        raise (Offline if retry and UNREACHABLE.search(err) else Failure)(
+            f"`{' '.join(cmd[:4])}` exited {p.returncode}: {err[-400:]}")
     return p.stdout.strip() if strip else p.stdout
 
 
@@ -113,7 +136,7 @@ def nul_list(out):
 
 
 def gh(*args, **kw):
-    return sh(["gh", *args], **kw)
+    return sh(["gh", *args], **({"retry": True} | kw))  # the runner's gh calls only read, so they're safe to repeat
 
 
 def gh_json(*args, **kw):
@@ -354,10 +377,10 @@ def same_server(a, b):
 
 
 def fetch(cfg, repo):
-    repo.git("fetch", "--quiet", "--prune", cfg["remote"], timeout=1800)
+    repo.git("fetch", "--quiet", "--prune", cfg["remote"], timeout=1800, retry=True)
     if cfg.get("upstream"):
         repo.git("fetch", "--quiet", "--no-tags", cfg["upstream"],
-                 f"+refs/heads/{cfg['upstream_branch']}:{upstream_ref(cfg)}", timeout=1800)
+                 f"+refs/heads/{cfg['upstream_branch']}:{upstream_ref(cfg)}", timeout=1800, retry=True)
 
 
 def untracked(repo):
@@ -446,9 +469,8 @@ def update_local(cfg, repo):
 
 # --- GitHub state -------------------------------------------------------------
 
-def reachable(host, port, wait_minutes=5):
-    """Wait a few minutes for the network, since timers fire right after resume."""
-    deadline = time.monotonic() + wait_minutes * 60
+def reachable(host, port, deadline):
+    """Whether `host` accepts a connection on `port`, trying until `deadline` (on time.monotonic())."""
     while True:
         try:
             socket.create_connection((host, port), timeout=10).close()
@@ -459,11 +481,16 @@ def reachable(host, port, wait_minutes=5):
             time.sleep(15)
 
 
-def online(cfg, repo):
-    if cfg["forge"] == "github":
-        return reachable("api.github.com", 443)
-    remote = parse_remote(repo.git("config", "--get", f"remote.{cfg['remote']}.url", check=False) or "")
-    return reachable(*remote[:2]) if remote else True
+def unreachable(cfg, repo, task, wait_minutes=5):
+    """The hosts a task needs, as host:port, that don't answer within a few minutes (timers fire right
+    after resume): the forge, and for a fork's checkout tasks the upstream, which every fetch reads too."""
+    hosts = [("api.github.com", 443)] if cfg["forge"] == "github" else []
+    urls = [] if cfg["forge"] == "github" else [repo.git("config", "--get", f"remote.{cfg['remote']}.url", check=False)]
+    if cfg.get("upstream") and task in CHECKOUT_TASKS:
+        urls.append(cfg["upstream"])
+    hosts += [parsed[:2] for url in urls if (parsed := parse_remote(url or ""))]
+    deadline = time.monotonic() + wait_minutes * 60
+    return [f"{host}:{port}" for host, port in dict.fromkeys(hosts) if not reachable(host, port, deadline)]
 
 
 def check_state(pr):
@@ -698,7 +725,7 @@ def gate_sync(cfg, repo, state, ctx):
         if behind and ctx.dry_run:
             notes.append(f"would fast-forward {mirror} by {behind} commits to upstream {up[:10]}")
         elif behind:
-            repo.git("push", "--quiet", remote, f"{up}:refs/heads/{mirror}", timeout=900)
+            repo.git("push", "--quiet", remote, f"{up}:refs/heads/{mirror}", timeout=900, retry=True)
             notes.append(f"fast-forwarded {mirror} by {behind} commits to upstream {up[:10]}")
     trees, features = worktrees(repo), []
     for name in fork_features(cfg, repo):
@@ -1141,15 +1168,15 @@ def run_task(cfg, repo, task, ctx, args):
     rec = {"task": task, "date": start.date().isoformat(), "start": start.isoformat(timespec="seconds")}
     if task == "report":
         rec["day"] = ctx.day
-    state, fields = repo.state(), {}
+    state, fields, offline = repo.state(), {}, False
     try:
         until = None if args.force else paused_until(state, task, start)
         if task in CHECKOUT_TASKS and not args.dry_run and (note := recover(cfg, repo, state)):
             fields["checkout"] = note
         if until:
             status, note = "blocked", f"paused after repeated failures until {until:%Y-%m-%d %H:%M}"
-        elif not online(cfg, repo):
-            status, note = "blocked", "offline"
+        elif down := unreachable(cfg, repo, task):
+            raise Offline(f"can't reach {', '.join(down)}")
         elif task in CHECKOUT_TASKS and (reason := check_checkout(cfg, repo)):
             status, note = "blocked", reason
         else:
@@ -1166,6 +1193,8 @@ def run_task(cfg, repo, task, ctx, args):
             if task == "sync" and status in ("ok", "done", "skipped") and cfg["sync"]["update_local"] and not args.dry_run:
                 if moved := update_local(cfg, repo):
                     status, note = ("done" if status == "skipped" else status), "; ".join([note, *moved])
+    except Offline as e:  # not the task's failure, so it isn't backed off
+        status, note, offline = "blocked", f"offline: {e}", True
     except Failure as e:
         status, note = "failed", str(e)
     except Exception as e:  # a bug or an unexpected reply: still recorded, reported and backed off
@@ -1178,9 +1207,15 @@ def run_task(cfg, repo, task, ctx, args):
     elif status in ("failed", "timeout"):
         f = state.setdefault("failures", {}).setdefault(task, {"count": 0})
         f.update(count=f["count"] + 1, last=start.isoformat(), error=note[:300])
+    retry = False
+    if offline:  # its unit starts it again until it has been offline this long; after that, only its timer does
+        since = state.setdefault("offline", {}).setdefault(task, start.isoformat())
+        retry = start - dt.datetime.fromisoformat(since) < dt.timedelta(hours=OFFLINE_RETRY_HOURS)
+    else:
+        state.get("offline", {}).pop(task, None)
     repo.save(state)
     repo.record(rec | {"end": now().isoformat(timespec="seconds"), "status": status, "note": note} | fields)
-    return 1 if status in ("failed", "timeout") else 0
+    return EX_TEMPFAIL if retry else 1 if status in ("failed", "timeout") else 0
 
 
 @contextlib.contextmanager
@@ -1217,7 +1252,9 @@ def cmd_run(args):
         rc = 0
         for day in days:
             ctx.day = day
-            rc |= run_task(cfg, repo, "report", ctx, args)
+            if (code := run_task(cfg, repo, "report", ctx, args)) == EX_TEMPFAIL:
+                return code  # the other days wait for the retry, rather than each waiting for the network
+            rc |= code
         if not args.dry_run:
             prune_runs(cfg, repo)
         return rc
@@ -1288,6 +1325,11 @@ Environment={path}
 ExecStart={python} {script} run {slug} {task}
 TimeoutStartSec={timeout}min
 Nice=10
+# A run that couldn't reach the network exits {tempfail}: start it again in 5 minutes, then less often, up to hourly.
+RestartForceExitStatus={tempfail}
+RestartSec=5min
+RestartSteps=4
+RestartMaxDelaySec=1h
 """
 
 TIMER = """\
@@ -1421,7 +1463,7 @@ def cmd_install(args):
                    path=unit_str("PATH=" + os.environ["PATH"]), python=unit_str(sys.executable, exec_line=True),
                    script=unit_str(SCRIPT, exec_line=True), schedule=schedule,
                    timeout=LOCK_WAIT_MINUTES + cfg[task]["timeout_minutes"] + 30,
-                   delay="0" if task == "report" else "5min")
+                   delay="0" if task == "report" else "5min", tempfail=EX_TEMPFAIL)
         units[f"{unit_name(slug, task)}.service"] = SERVICE.format(**fmt)
         units[f"{unit_name(slug, task)}.timer"] = TIMER.format(**fmt)
     if args.dry_run:
@@ -1470,10 +1512,15 @@ def cmd_status(args):
     print(sh(["systemctl", "--user", "list-timers", "--all", "--no-pager",
               *[f"{unit_name(s, '*')}.timer" for s in slugs]], check=False))
     for slug in slugs:
-        repo = Repo(slug)
+        repo, t = Repo(slug), now()
+        state = repo.state()
         print(f"\n{slug}")
-        for t in paused_tasks(repo.state()):
-            print(f"  {t['task']} is backing off after {t['failures_in_a_row']} failures: {t['last_error']}")
+        for p in paused_tasks(state):
+            print(f"  {p['task']} is backing off after {p['failures_in_a_row']} failures: {p['last_error']}")
+        for task, since in state.get("offline", {}).items():
+            until = dt.datetime.fromisoformat(since) + dt.timedelta(hours=OFFLINE_RETRY_HOURS)
+            print(f"  {task} has been offline since {since[:16].replace('T', ' ')}; "
+                  + (f"retried up to hourly until {until:%Y-%m-%d %H:%M}" if t < until else "waiting for its timer"))
         for r in repo.runs()[-args.last:]:
             session = f"  [session {r['session']}]" if r.get("session") else ""
             print(f"  {r['start'][:16].replace('T', ' ')}  {r['task']:<6} {r['status']:<8} {r.get('note', '')}{session}")

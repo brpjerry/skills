@@ -1,8 +1,12 @@
 """Tests for global/repo-maintainer/scripts/maintainer.py. Stdlib only, no network: GitHub calls are faked,
 and the checkout logic runs against throwaway git repos."""
+import argparse
+import contextlib
 import datetime as dt
 import importlib.util
+import io
 import os
+import socket
 import tempfile
 import tomllib
 import unittest
@@ -363,6 +367,110 @@ class Checkout(unittest.TestCase):
         self.assertEqual((self.dir / "wt2" / "a.txt").read_text(), "the owner's work in progress\n")
         self.assertTrue((self.dir / "wt1" / "b1.txt").exists())
         self.assertTrue(any("left local b2" in n for n in notes))
+
+
+class Network(unittest.TestCase):
+    """Retries and offline runs, with fake commands and local sockets instead of the network."""
+
+    # As git and gh printed them during the 2026-11-04 outage.
+    DNS = ["fatal: unable to access 'https://github.com/herdrdev/herdr.git/': Could not resolve host: github.com",
+           "fatal: unable to look up git.rockbox.org (port 9418) (Temporary failure in name resolution)",
+           "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
+           "ssh: connect to host forge.internal port 2222: Connection refused"]
+    SERVER = ["HTTP 502: Bad Gateway (https://api.github.com/graphql)",
+              "error: RPC failed; curl 56 GnuTLS recv error (-110)\nfatal: early EOF",
+              "fatal: the remote end hung up unexpectedly"]
+    OTHER = ["fatal: couldn't find remote ref refs/heads/nope", "HTTP 404: Not Found (https://api.github.com/x)",
+             "git@forge.internal: Permission denied (publickey).\nfatal: Could not read from remote repository."]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.saved = m.RETRY_DELAYS, m.STATE_DIR, m.unreachable
+        m.RETRY_DELAYS, m.STATE_DIR = (0, 0, 0), self.dir / "state"
+
+    def tearDown(self):
+        m.RETRY_DELAYS, m.STATE_DIR, m.unreachable = self.saved
+        self.tmp.cleanup()
+
+    def flaky(self, error, failures):
+        """A command that prints `error` and exits 128 on its first `failures` runs, and a count of its runs."""
+        (self.dir / "err").write_text(error)
+        count = self.dir / "count"
+        count.write_text("0")
+        script = (f'n=$(cat "{count}"); echo $((n + 1)) > "{count}"; '
+                  f'if [ "$n" -ge {failures} ]; then echo ok; else cat "{self.dir / "err"}" >&2; exit 128; fi')
+        return ["sh", "-c", script], lambda: int(count.read_text())
+
+    def test_classifies_errors(self):
+        for e in self.DNS:
+            self.assertTrue(m.UNREACHABLE.search(e) and m.NETWORK_ERROR.search(e), e)
+        for e in self.SERVER:
+            self.assertTrue(m.NETWORK_ERROR.search(e) and not m.UNREACHABLE.search(e), e)
+        for e in self.OTHER:
+            self.assertFalse(m.NETWORK_ERROR.search(e), e)
+
+    def test_network_error_is_retried_until_it_clears(self):
+        cmd, runs = self.flaky(self.DNS[0], failures=2)
+        self.assertEqual(m.sh(cmd, retry=True), "ok")
+        self.assertEqual(runs(), 3)
+
+    def test_host_still_unreachable_is_offline(self):
+        cmd, runs = self.flaky(self.DNS[1], failures=99)
+        with self.assertRaises(m.Offline):
+            m.sh(cmd, retry=True)
+        self.assertEqual(runs(), len(m.RETRY_DELAYS) + 1)
+
+    def test_server_still_failing_is_a_failure(self):
+        cmd, runs = self.flaky(self.SERVER[0], failures=99)
+        with self.assertRaises(m.Failure) as caught:
+            m.sh(cmd, retry=True)
+        self.assertNotIsInstance(caught.exception, m.Offline)
+        self.assertEqual(runs(), len(m.RETRY_DELAYS) + 1)
+
+    def test_other_errors_and_local_commands_are_not_retried(self):
+        for error, retry in [(self.OTHER[0], True), (self.DNS[0], False)]:
+            cmd, runs = self.flaky(error, failures=99)
+            with self.assertRaises(m.Failure) as caught:
+                m.sh(cmd, retry=retry)
+            self.assertNotIsInstance(caught.exception, m.Offline)
+            self.assertEqual(runs(), 1)
+
+    def test_unreachable_includes_a_forks_upstream(self):
+        server = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(server.close)
+        with socket.create_server(("127.0.0.1", 0)) as gone:
+            closed = gone.getsockname()[1]
+        git(self.dir, "init", "-q", "co")
+        git(self.dir / "co", "remote", "add", "origin", f"ssh://git@127.0.0.1:{server.getsockname()[1]}/me/proj.git")
+        repo = m.Repo("t")
+        repo.checkout = self.dir / "co"
+        cfg = config(forge="git", repo="127.0.0.1/me/proj", upstream=f"git://127.0.0.1:{closed}/up",
+                     upstream_branch="main")
+        self.assertEqual(m.unreachable(cfg, repo, "sync", wait_minutes=0), [f"127.0.0.1:{closed}"])
+        self.assertEqual(m.unreachable(cfg, repo, "report", wait_minutes=0), [])  # reports don't fetch
+
+    def test_offline_run_is_retried_for_a_while_without_backing_off(self):
+        cfg = config(forge="git", repo="git.example.org/me/proj", report_dir=str(self.dir / "reports"))
+        repo = m.Repo("me_proj")
+        repo.dir.mkdir(parents=True)
+        args = argparse.Namespace(force=False, dry_run=False)
+        ctx = m.Ctx(cfg, dry_run=False)
+        ctx.day = "2026-11-04"
+        self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+        m.unreachable = lambda *a, **kw: ["github.com:443"]
+        self.assertEqual(m.run_task(cfg, repo, "report", ctx, args), m.EX_TEMPFAIL)
+        self.assertEqual(repo.runs()[-1]["status"], "blocked")
+        self.assertEqual(repo.runs()[-1]["note"], "offline: can't reach github.com:443")
+        self.assertNotIn("failures", repo.state())
+        state = repo.state()
+        state["offline"]["report"] = (m.now() - dt.timedelta(hours=m.OFFLINE_RETRY_HOURS + 1)).isoformat()
+        repo.save(state)
+        self.assertEqual(m.run_task(cfg, repo, "report", ctx, args), 0)  # offline too long: left to the timer
+        m.unreachable = lambda *a, **kw: []
+        self.assertEqual(m.run_task(cfg, repo, "report", ctx, args), 0)
+        self.assertEqual(repo.runs()[-1]["status"], "done")
+        self.assertNotIn("report", repo.state()["offline"])
 
 
 if __name__ == "__main__":
