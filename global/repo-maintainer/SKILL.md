@@ -21,7 +21,7 @@ The first argument picks the mode:
 | `scan <run-dir>` | timer | `references/scan.md` |
 | `report <run-dir>` | timer, end of day | `references/report.md` |
 | `setup` | the user, inside the checkout | `references/setup.md` |
-| `status` | the user | Run `python3 <this skill's directory>/scripts/maintainer.py status` and summarize: next runs, recent results, runs that couldn't start, and anything backing off after failures. Report what the output says, without guessing at causes. Untracked files never block a run. |
+| `status` | the user | Run `python3 <this skill's directory>/scripts/maintainer.py status` and summarize: next runs, recent results, runs that couldn't start, anything backing off after failures, and anything retrying while offline. Report what the output says, without guessing at causes. Untracked files never block a run. |
 
 For a timer task, read `<run-dir>/context.json`, then the task's instructions. Nobody is watching a timer run, so never ask a question or wait for input. When unsure, take the conservative option and say so in the summary.
 
